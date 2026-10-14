@@ -1,0 +1,10 @@
+# --- Генератор (script.py + модуль llm/) ---
+# openai: клиент OpenAI-совместимого API (llm/client.py)
+openai>=1.0.0
+# python-dotenv: загрузка переменных из .env (llm/config.py)
+python-dotenv>=1.0.0
+
+# --- Запуск сгенерированных ботов ---
+# aiogram: фреймворк Telegram-ботов (сгенерированный код)
+aiogram>=3.7,<4.0
+

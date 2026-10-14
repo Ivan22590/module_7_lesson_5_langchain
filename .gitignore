@@ -1,0 +1,57 @@
+# --- Секреты и переменные окружения ---
+.env
+.env.local
+.env.*.local
+# Оставляем шаблон в репозитории
+!.env.example
+
+# --- Виртуальное окружение ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Кэш Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- Артефакты сборки и дистрибутивы ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Тесты и покрытие ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Инструменты проверки кода ---
+.mypy_cache/
+.ruff_cache/
+
+# --- IDE и редакторы ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- ОС ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Сгенерированные боты (результат работы script.py) ---
+generated_bot.py
+test_meme_bot.py
+
+# --- Логи ---
+*.log
+logs/
+
+# --- Медиа для бота ---
+memes/
