@@ -1,6 +1,6 @@
 """LangChain-цепочка для генерации кода Telegram-бота по описанию пользователя.
 
-Цепочка состоит из 5 звеньев:
+Цепочка состоит из 5 звеньев, реализованных через ``langchain-core``:
 
     1. analysis_chain   — анализ пользовательского запроса
     2. build_tools_chain — выделение необходимых инструментов
@@ -8,8 +8,9 @@
     4. code_chain        — генерация полного кода Telegram-бота
     5. review_chain      — проверка сгенерированного кода
 
-Модуль использует локальный LLM-клиент из пакета ``llm`` и модуль LangChain
-для структурирования промптов.
+Каждое звено — это LangChain-цепочка ``prompt | llm | parser``,
+где ``ChatPromptTemplate`` формирует запрос, ``ChatOpenAI`` (через ProxyAPI)
+вызывает модель, а ``StrOutputParser`` извлекает сырой ответ.
 
 Пример запуска::
 
@@ -33,7 +34,16 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-from llm import LLMClient, ChatMessage, ChatResult, user_message
+# ---------------------------------------------------------------------------
+# LangChain-импорты
+# ---------------------------------------------------------------------------
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+
+# Загружаем .env до инициализации ChatOpenAI — иначе ключ не найдётся
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Логирование
@@ -48,32 +58,30 @@ logging.basicConfig(
 logger = logging.getLogger("bot_generator")
 
 # ---------------------------------------------------------------------------
-# Инициализация LLM-клиента (использует ключ из .env)
+# Конфигурация LLM (ProxyAPI — OpenAI-совместимый API)
 # ---------------------------------------------------------------------------
 
-llm_client = LLMClient()
+PROXYAPI_BASE_URL: str = os.getenv(
+    "PROXYAPI_BASE_URL", "https://api.proxyapi.ru/v1"
+)
+PROXYAPI_API_KEY: str = os.getenv("PROXYAPI_API_KEY", "")
+PROXYAPI_MODEL: str = os.getenv("PROXYAPI_MODEL", "openai/gpt-6-luna")
+
+llm = ChatOpenAI(
+    openai_api_key=PROXYAPI_API_KEY,
+    openai_api_base=PROXYAPI_BASE_URL,
+    model=PROXYAPI_MODEL,
+    timeout=120,
+    max_retries=2,
+)
+
+# Парсер сырого текста от модели
+parser = StrOutputParser()
 
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
-
-
-def call_llm(messages: list[dict[str, str]]) -> str:
-    """Отправляет сообщения через локальный LLM-клиент и возвращает текст ответа.
-
-    Args:
-        messages: Список словарей с полями ``role`` и ``content``.
-
-    Returns:
-        Текстовый ответ модели.
-
-    Raises:
-        LLMAPIError: при ошибке обращения к API или пустом ответе.
-    """
-    chat_messages = [ChatMessage(m["role"], m["content"]) for m in messages]
-    result: ChatResult = llm_client.chat(chat_messages)
-    return result.content
 
 
 def extract_json(raw: str) -> str:
@@ -111,12 +119,19 @@ def extract_json(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# LangChain-цепочки (каждое звено = ChatPromptTemplate | ChatOpenAI | StrOutputParser)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Chain 1: Анализ пользовательского запроса
 # ---------------------------------------------------------------------------
 
-ANALYSIS_PROMPT = textwrap.dedent("""\
-Ты — опытный аналитик технических заданий для Telegram-ботов.
+ANALYSIS_SYSTEM = (
+    "Ты — аналитик технических заданий для Telegram-ботов. "
+    "Всегда возвращай валидный JSON без текста."
+)
 
+ANALYSIS_USER = textwrap.dedent("""\
 Пользователь описал бота своими словами. Проанализируй описание и верни
 СТРУКТУРИРОВАННЫЙ JSON без лишних текстовых комментариев.
 
@@ -134,56 +149,26 @@ ANALYSIS_PROMPT = textwrap.dedent("""\
 }}
 """)
 
+analysis_prompt = ChatPromptTemplate.from_messages([
+    ("system", ANALYSIS_SYSTEM),
+    ("user", ANALYSIS_USER),
+])
 
-def analysis_chain(user_request: str) -> dict[str, Any]:
-    """Chain 1: анализирует текстовое описание бота и возвращает структуру задания.
-
-    Извлекает из описания список команд, обработчиков, формат ответа,
-    необходимость базы данных и дополнительные зависимости.
-
-    Args:
-        user_request: Текстовое описание бота от пользователя.
-
-    Returns:
-        Словарь со структурой задания. Ключи:
-        ``commands`` (list[str]), ``handlers`` (list[str]),
-        ``response_format`` (str), ``needs_database`` (bool),
-        ``extra_dependencies`` (list[str]), ``description`` (str).
-
-    Raises:
-        ValueError: если модель вернула ответ, из которого не удаётся
-            извлечь корректный JSON.
-        LLMAPIError: при ошибке обращения к API.
-    """
-    logger.info("▶ Chain 1: Анализ пользовательского запроса — «%s»", user_request)
-    messages = [
-        {
-            "role": "system",
-            "content": "Ты — аналитик технических заданий для Telegram-ботов. Всегда возвращай валидный JSON без текста.",
-        },
-        {"role": "user", "content": ANALYSIS_PROMPT.format(user_request=user_request)},
-    ]
-    raw = call_llm(messages)
-    logger.info("  Модель: %s | Длина ответа: %d символов", "gpt", len(raw))
-    json_str = extract_json(raw)
-    analysis: dict[str, Any] = json.loads(json_str)
-    logger.info(
-        "  Выделено команд: %d | Обработчиков: %d | База данных: %s",
-        len(analysis.get("commands", [])),
-        len(analysis.get("handlers", [])),
-        "да" if analysis.get("needs_database") else "нет",
-    )
-    logger.info("✓ Chain 1 завершена")
-    return analysis
+analysis_chain = analysis_prompt | llm | parser
 
 
 # ---------------------------------------------------------------------------
 # Chain 2: Build Tools — выделение инструментов
 # ---------------------------------------------------------------------------
 
-TOOLS_PROMPT = textwrap.dedent("""\
-Ты — архитектор Telegram-ботов. На основе анализа задания определи,
-какие инструменты и библиотеки потребуются для реализации.
+TOOLS_SYSTEM = (
+    "Ты — архитектор Telegram-ботов. "
+    "Всегда возвращай валидный JSON без текста."
+)
+
+TOOLS_USER = textwrap.dedent("""\
+На основе анализа задания определи, какие инструменты и библиотеки
+потребуются для реализации.
 
 Анализ задания:
 {analysis_json}
@@ -199,60 +184,24 @@ TOOLS_PROMPT = textwrap.dedent("""\
 }}
 """)
 
+tools_prompt = ChatPromptTemplate.from_messages([
+    ("system", TOOLS_SYSTEM),
+    ("user", TOOLS_USER),
+])
 
-def build_tools_chain(analysis: dict[str, Any]) -> dict[str, Any]:
-    """Chain 2: определяет инструменты и зависимости для реализации бота.
-
-    На основе проанализированного задания определяет, какие API,
-    middleware и переменные окружения потребуются.
-
-    Args:
-        analysis: Словарь, полученный из ``analysis_chain``.
-
-    Returns:
-        Словарь с информацией об инструментах. Ключи:
-        ``telegram_api`` (str), ``middleware`` (list[str]),
-        ``error_handling`` (str), ``logging`` (str),
-        ``environment_vars`` (list[str]), ``third_party_apis`` (list[str]).
-
-    Raises:
-        ValueError: если модель вернула ответ, из которого не удаётся
-            извлечь корректный JSON.
-        LLMAPIError: при ошибке обращения к API.
-    """
-    logger.info("▶ Chain 2: Определение инструментов и зависимостей")
-    messages = [
-        {
-            "role": "system",
-            "content": "Ты — архитектор Telegram-ботов. Всегда возвращай валидный JSON без текста.",
-        },
-        {
-            "role": "user",
-            "content": TOOLS_PROMPT.format(
-                analysis_json=json.dumps(analysis, ensure_ascii=False)
-            ),
-        },
-    ]
-    raw = call_llm(messages)
-    logger.info("  Модель: %s | Длина ответа: %d символов", "gpt", len(raw))
-    json_str = extract_json(raw)
-    tools: dict[str, Any] = json.loads(json_str)
-    logger.info(
-        "  Telegram API: %s | Переменные окружения: %s",
-        tools.get("telegram_api", ""),
-        ", ".join(tools.get("environment_vars", [])),
-    )
-    logger.info("✓ Chain 2 завершена")
-    return tools
+tools_chain = tools_prompt | llm | parser
 
 
 # ---------------------------------------------------------------------------
 # Chain 3: Дизайн и структура кода
 # ---------------------------------------------------------------------------
 
-DESIGN_PROMPT = textwrap.dedent("""\
-Ты — опытный Python-архитектор Telegram-ботов на aiogram 3.x.
+DESIGN_SYSTEM = (
+    "Ты — Python-архитектор. "
+    "Всегда возвращай валидный JSON без текста."
+)
 
+DESIGN_USER = textwrap.dedent("""\
 На основе анализа задания и выбранных инструментов спроектируй структуру кода.
 
 Анализ задания:
@@ -275,62 +224,24 @@ DESIGN_PROMPT = textwrap.dedent("""\
 }}
 """)
 
+design_prompt = ChatPromptTemplate.from_messages([
+    ("system", DESIGN_SYSTEM),
+    ("user", DESIGN_USER),
+])
 
-def design_chain(analysis: dict[str, Any], tools: dict[str, Any]) -> dict[str, Any]:
-    """Chain 3: проектирует архитектуру и структуру файлов бота.
-
-    Определяет модули, классы, настройку dispatcher и middleware.
-
-    Args:
-        analysis: Словарь из ``analysis_chain``.
-        tools: Словарь из ``build_tools_chain``.
-
-    Returns:
-        Словарь с архитектурными решениями. Ключи:
-        ``file_structure`` (list[str]), ``main_module`` (str),
-        ``handlers_module`` (str), ``classes`` (list[dict]),
-        ``dispatcher_setup`` (str), ``middleware_config`` (str),
-        ``startup_sequence`` (list[str]).
-
-    Raises:
-        ValueError: если модель вернула ответ, из которого не удаётся
-            извлечь корректный JSON.
-        LLMAPIError: при ошибке обращения к API.
-    """
-    logger.info("▶ Chain 3: Проектирование структуры кода")
-    messages = [
-        {
-            "role": "system",
-            "content": "Ты — Python-архитектор. Всегда возвращай валидный JSON без текста.",
-        },
-        {
-            "role": "user",
-            "content": DESIGN_PROMPT.format(
-                analysis_json=json.dumps(analysis, ensure_ascii=False),
-                tools_json=json.dumps(tools, ensure_ascii=False),
-            ),
-        },
-    ]
-    raw = call_llm(messages)
-    logger.info("  Модель: %s | Длина ответа: %d символов", "gpt", len(raw))
-    json_str = extract_json(raw)
-    design: dict[str, Any] = json.loads(json_str)
-    logger.info(
-        "  Файлов в проекте: %d | Классов: %d",
-        len(design.get("file_structure", [])),
-        len(design.get("classes", [])),
-    )
-    logger.info("✓ Chain 3 завершена")
-    return design
+design_chain = design_prompt | llm | parser
 
 
 # ---------------------------------------------------------------------------
 # Chain 4: Генерация кода Telegram-бота
 # ---------------------------------------------------------------------------
 
-CODE_PROMPT = textwrap.dedent("""\
-Ты — опытный Python-разработчик Telegram-ботов на aiogram 3.x.
+CODE_SYSTEM = (
+    "Ты — Python-разработчик. "
+    "Верни ТОЛЬКО код Python, без markdown-обёрток и пояснений."
+)
 
+CODE_USER = textwrap.dedent("""\
 Сгенерируй ПОЛНЫЙ РАБОЧИЙ код Telegram-бота на основе:
 
 Дизайн проекта:
@@ -360,69 +271,24 @@ CODE_PROMPT = textwrap.dedent("""\
 Верни ТОЛЬКО код без markdown-обёрток. Начни сразу с импортов.
 """)
 
+code_prompt = ChatPromptTemplate.from_messages([
+    ("system", CODE_SYSTEM),
+    ("user", CODE_USER),
+])
 
-def code_chain(
-    analysis: dict[str, Any],
-    tools: dict[str, Any],
-    design: dict[str, Any],
-) -> str:
-    """Chain 4: генерирует полный рабочий код Telegram-бота на aiogram 3.x.
-
-    На основе спроектированной архитектуры создаёт полный исходный код
-    с обработчиками, middleware и корректным запуском.
-
-    Args:
-        analysis: Словарь из ``analysis_chain``.
-        tools: Словарь из ``build_tools_chain``.
-        design: Словарь из ``design_chain``.
-
-    Returns:
-        Строка с полным кодом Python-бота.
-
-    Raises:
-        ValueError: если модель вернула пустой или некорректный код.
-        LLMAPIError: при ошибке обращения к API.
-    """
-    logger.info("▶ Chain 4: Генерация кода Telegram-бота")
-    messages = [
-        {
-            "role": "system",
-            "content": "Ты — Python-разработчик. Верни ТОЛЬКО код Python, без markdown-обёрток и пояснений.",
-        },
-        {
-            "role": "user",
-            "content": CODE_PROMPT.format(
-                design_json=json.dumps(design, ensure_ascii=False),
-                analysis_json=json.dumps(analysis, ensure_ascii=False),
-                tools_json=json.dumps(tools, ensure_ascii=False),
-            ),
-        },
-    ]
-    raw = call_llm(messages)
-    logger.info("  Модель: %s | Длина ответа: %d символов", "gpt", len(raw))
-    code = raw.strip()
-    # Убираем markdown-обёртки если они есть
-    if code.startswith("```python"):
-        code = code[len("```python"):]
-    elif code.startswith("```"):
-        code = code[3:]
-    if code.endswith("```"):
-        code = code[:-3]
-    code = code.strip()
-    if not code:
-        raise ValueError("Модель вернула пустой код")
-    logger.info("  Сгенерировано: %d символов кода", len(code))
-    logger.info("✓ Chain 4 завершена")
-    return code
+code_chain = code_prompt | llm | parser
 
 
 # ---------------------------------------------------------------------------
 # Chain 5: Review — проверка сгенерированного кода
 # ---------------------------------------------------------------------------
 
-REVIEW_PROMPT = textwrap.dedent("""\
-Ты — эксперт по кодовым ревью Python-ботов.
+REVIEW_SYSTEM = (
+    "Ты — эксперт по кодовым ревью. "
+    "Всегда возвращай валидный JSON без текста."
+)
 
+REVIEW_USER = textwrap.dedent("""\
 Проверь следующий код Telegram-бота и верни JSON с результатами:
 
 Код для проверки:
@@ -452,12 +318,179 @@ REVIEW_PROMPT = textwrap.dedent("""\
 }}
 """)
 
+review_prompt = ChatPromptTemplate.from_messages([
+    ("system", REVIEW_SYSTEM),
+    ("user", REVIEW_USER),
+])
 
-def review_chain(code: str) -> dict[str, Any]:
-    """Chain 5: проверяет сгенерированный код на корректность.
+review_chain = review_prompt | llm | parser
 
-    Отправляет код на ревью LLM и возвращает структурированный отчёт
-    о качестве кода с оценками по ключевым параметрам.
+
+# ---------------------------------------------------------------------------
+# Функции-обёртки звеньев (логирование + парсинг JSON / кода)
+# ---------------------------------------------------------------------------
+
+
+def run_analysis_chain(user_request: str) -> dict[str, Any]:
+    """Chain 1: запускает LangChain-цепочку анализа и возвращает структуру задания.
+
+    Цепочка ``analysis_prompt | llm | parser`` формирует промпт, отправляет
+    его в модель и возвращает текст, из которого извлекается JSON.
+
+    Args:
+        user_request: Текстовое описание бота от пользователя.
+
+    Returns:
+        Словарь со структурой задания. Ключи:
+        ``commands`` (list[str]), ``handlers`` (list[str]),
+        ``response_format`` (str), ``needs_database`` (bool),
+        ``extra_dependencies`` (list[str]), ``description`` (str).
+
+    Raises:
+        ValueError: если модель вернула ответ, из которого не удаётся
+            извлечь корректный JSON.
+        Exception: при ошибке обращения к API.
+    """
+    logger.info("▶ Chain 1: Анализ пользовательского запроса — «%s»", user_request)
+    raw: str = analysis_chain.invoke({"user_request": user_request})
+    logger.info("  Модель: %s | Длина ответа: %d символов", PROXYAPI_MODEL, len(raw))
+    json_str = extract_json(raw)
+    analysis: dict[str, Any] = json.loads(json_str)
+    logger.info(
+        "  Выделено команд: %d | Обработчиков: %d | База данных: %s",
+        len(analysis.get("commands", [])),
+        len(analysis.get("handlers", [])),
+        "да" if analysis.get("needs_database") else "нет",
+    )
+    logger.info("✓ Chain 1 завершена")
+    return analysis
+
+
+def run_build_tools_chain(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Chain 2: запускает LangChain-цепочку определения инструментов.
+
+    Цепочка ``tools_prompt | llm | parser`` на основе анализа задания
+    определяет API, middleware и переменные окружения.
+
+    Args:
+        analysis: Словарь, полученный из ``run_analysis_chain``.
+
+    Returns:
+        Словарь с информацией об инструментах. Ключи:
+        ``telegram_api`` (str), ``middleware`` (list[str]),
+        ``error_handling`` (str), ``logging`` (str),
+        ``environment_vars`` (list[str]), ``third_party_apis`` (list[str]).
+
+    Raises:
+        ValueError: если модель вернула ответ, из которого не удаётся
+            извлечь корректный JSON.
+        Exception: при ошибке обращения к API.
+    """
+    logger.info("▶ Chain 2: Определение инструментов и зависимостей")
+    raw: str = tools_chain.invoke({
+        "analysis_json": json.dumps(analysis, ensure_ascii=False),
+    })
+    logger.info("  Модель: %s | Длина ответа: %d символов", PROXYAPI_MODEL, len(raw))
+    json_str = extract_json(raw)
+    tools: dict[str, Any] = json.loads(json_str)
+    logger.info(
+        "  Telegram API: %s | Переменные окружения: %s",
+        tools.get("telegram_api", ""),
+        ", ".join(tools.get("environment_vars", [])),
+    )
+    logger.info("✓ Chain 2 завершена")
+    return tools
+
+
+def run_design_chain(analysis: dict[str, Any], tools: dict[str, Any]) -> dict[str, Any]:
+    """Chain 3: запускает LangChain-цепочку проектирования архитектуры.
+
+    Цепочка ``design_prompt | llm | parser`` определяет модули, классы,
+    настройку dispatcher и middleware.
+
+    Args:
+        analysis: Словарь из ``run_analysis_chain``.
+        tools: Словарь из ``run_build_tools_chain``.
+
+    Returns:
+        Словарь с архитектурными решениями. Ключи:
+        ``file_structure`` (list[str]), ``main_module`` (str),
+        ``handlers_module`` (str), ``classes`` (list[dict]),
+        ``dispatcher_setup`` (str), ``middleware_config`` (str),
+        ``startup_sequence`` (list[str]).
+
+    Raises:
+        ValueError: если модель вернула ответ, из которого не удаётся
+            извлечь корректный JSON.
+        Exception: при ошибке обращения к API.
+    """
+    logger.info("▶ Chain 3: Проектирование структуры кода")
+    raw: str = design_chain.invoke({
+        "analysis_json": json.dumps(analysis, ensure_ascii=False),
+        "tools_json": json.dumps(tools, ensure_ascii=False),
+    })
+    logger.info("  Модель: %s | Длина ответа: %d символов", PROXYAPI_MODEL, len(raw))
+    json_str = extract_json(raw)
+    design: dict[str, Any] = json.loads(json_str)
+    logger.info(
+        "  Файлов в проекте: %d | Классов: %d",
+        len(design.get("file_structure", [])),
+        len(design.get("classes", [])),
+    )
+    logger.info("✓ Chain 3 завершена")
+    return design
+
+
+def run_code_chain(
+    analysis: dict[str, Any],
+    tools: dict[str, Any],
+    design: dict[str, Any],
+) -> str:
+    """Chain 4: запускает LangChain-цепочку генерации кода бота.
+
+    Цепочка ``code_prompt | llm | parser`` создаёт полный исходный код
+    на aiogram 3.x с обработчиками, middleware и корректным запуском.
+
+    Args:
+        analysis: Словарь из ``run_analysis_chain``.
+        tools: Словарь из ``run_build_tools_chain``.
+        design: Словарь из ``run_design_chain``.
+
+    Returns:
+        Строка с полным кодом Python-бота.
+
+    Raises:
+        ValueError: если модель вернула пустой или некорректный код.
+        Exception: при ошибке обращения к API.
+    """
+    logger.info("▶ Chain 4: Генерация кода Telegram-бота")
+    raw: str = code_chain.invoke({
+        "design_json": json.dumps(design, ensure_ascii=False),
+        "analysis_json": json.dumps(analysis, ensure_ascii=False),
+        "tools_json": json.dumps(tools, ensure_ascii=False),
+    })
+    logger.info("  Модель: %s | Длина ответа: %d символов", PROXYAPI_MODEL, len(raw))
+    code = raw.strip()
+    # Убираем markdown-обёртки если они есть
+    if code.startswith("```python"):
+        code = code[len("```python"):]
+    elif code.startswith("```"):
+        code = code[3:]
+    if code.endswith("```"):
+        code = code[:-3]
+    code = code.strip()
+    if not code:
+        raise ValueError("Модель вернула пустой код")
+    logger.info("  Сгенерировано: %d символов кода", len(code))
+    logger.info("✓ Chain 4 завершена")
+    return code
+
+
+def run_review_chain(code: str) -> dict[str, Any]:
+    """Chain 5: запускает LangChain-цепочку ревью сгенерированного кода.
+
+    Цепочка ``review_prompt | llm | parser`` проверяет код и возвращает
+    структурированный отчёт о качестве с оценками по ключевым параметрам.
 
     Args:
         code: Строка с кодом Python-бота для проверки.
@@ -472,18 +505,11 @@ def review_chain(code: str) -> dict[str, Any]:
     Raises:
         ValueError: если модель вернула ответ, из которого не удаётся
             извлечь корректный JSON.
-        LLMAPIError: при ошибке обращения к API.
+        Exception: при ошибке обращения к API.
     """
     logger.info("▶ Chain 5: Проверка сгенерированного кода (%d символов)", len(code))
-    messages = [
-        {
-            "role": "system",
-            "content": "Ты — эксперт по кодовым ревью. Всегда возвращай валидный JSON без текста.",
-        },
-        {"role": "user", "content": REVIEW_PROMPT.format(code=code)},
-    ]
-    raw = call_llm(messages)
-    logger.info("  Модель: %s | Длина ответа: %d символов", "gpt", len(raw))
+    raw: str = review_chain.invoke({"code": code})
+    logger.info("  Модель: %s | Длина ответа: %d символов", PROXYAPI_MODEL, len(raw))
     json_str = extract_json(raw)
     review: dict[str, Any] = json.loads(json_str)
     logger.info(
@@ -553,19 +579,19 @@ def generate_bot(user_request: str, output_file: str = "generated_bot.py") -> di
     logger.info("Файл вывода: %s", output_file)
 
     # --- Chain 1: Анализ ---
-    analysis = analysis_chain(user_request)
+    analysis = run_analysis_chain(user_request)
 
     # --- Chain 2: Build Tools ---
-    tools = build_tools_chain(analysis)
+    tools = run_build_tools_chain(analysis)
 
     # --- Chain 3: Дизайн ---
-    design = design_chain(analysis, tools)
+    design = run_design_chain(analysis, tools)
 
     # --- Chain 4: Генерация кода ---
-    code = code_chain(analysis, tools, design)
+    code = run_code_chain(analysis, tools, design)
 
     # --- Chain 5: Review ---
-    review = review_chain(code)
+    review = run_review_chain(code)
     syntax_ok = syntax_check(code)
     review["syntax_ast_ok"] = syntax_ok
     review["all_checks_passed"] = (

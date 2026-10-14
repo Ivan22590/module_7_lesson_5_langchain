@@ -4,7 +4,12 @@
 
 ## Как это работает
 
-Вы описываете бота обычным текстом — цепочка из 5 LLM-звеньев анализирует задание, проектирует архитектуру, генерирует код и проверяет его качество. На выходе — готовый `.py` файл, который можно запустить.
+Вы описываете бота обычным текстом — цепочка из 5 звеньев анализирует задание, проектирует архитектуру, генерирует код и проверяет его качество. На выходе — готовый `.py` файл, который можно запустить.
+
+Каждое звено — это **LangChain-цепочка** ``prompt | llm | parser``:
+- ``ChatPromptTemplate`` формирует системный и пользовательский промпты
+- ``ChatOpenAI`` (через ProxyAPI) вызывает LLM
+- ``StrOutputParser`` извлекает сырой текст ответа
 
 ```bash
 python script.py "Бот, который отправляет случайные мемы"
@@ -15,11 +20,11 @@ python script.py "Бот, который отправляет случайные
 
 | # | Звено | Что делает | Результат |
 |---|-------|------------|-----------|
-| 1 | `analysis_chain` | Анализирует описание бота | JSON: команды, обработчики, формат ответа, нужна ли БД, зависимости |
-| 2 | `build_tools_chain` | Определяет инструменты реализации | JSON: API, middleware, обработка ошибок, переменные окружения |
-| 3 | `design_chain` | Проектирует архитектуру | JSON: структура файлов, классы, настройка dispatcher |
-| 4 | `code_chain` | Генерирует код | Полный исходник бота на aiogram 3.x |
-| 5 | `review_chain` | Проверяет код | JSON: оценки по 7 параметрам, проблемы, оценка 0–10 + проверка `ast.parse` |
+| 1 | `analysis_chain` | `ChatPromptTemplate \| ChatOpenAI \| StrOutputParser` — анализ описания бота | JSON: команды, обработчики, формат ответа, нужна ли БД, зависимости |
+| 2 | `tools_chain` | `ChatPromptTemplate \| ChatOpenAI \| StrOutputParser` — определение инструментов | JSON: API, middleware, обработка ошибок, переменные окружения |
+| 3 | `design_chain` | `ChatPromptTemplate \| ChatOpenAI \| StrOutputParser` — проектирование архитектуры | JSON: структура файлов, классы, настройка dispatcher |
+| 4 | `code_chain` | `ChatPromptTemplate \| ChatOpenAI \| StrOutputParser` — генерация кода | Полный исходник бота на aiogram 3.x |
+| 5 | `review_chain` | `ChatPromptTemplate \| ChatOpenAI \| StrOutputParser` — проверка кода | JSON: оценки по 7 параметрам, проблемы, оценка 0–10 + проверка `ast.parse` |
 
 Дополнительно к LLM-ревью код проверяется синтаксически (`ast.parse`) и через subprocess-тест — это гарантирует отсутствие синтаксических ошибок.
 
@@ -162,23 +167,28 @@ LOG_LEVEL=DEBUG python script.py "Бот для опросов"           # Linu
         │
         ▼
 ┌──────────────────────┐
-│ Chain 1: Анализ       │  → команды, обработчики, формат ответа, БД
+│ analysis_chain        │  ChatPromptTemplate | ChatOpenAI | StrOutputParser
+│ (анализ)              │  → команды, обработчики, формат ответа, БД
 └─────────┬────────────┘
           ▼
 ┌──────────────────────┐
-│ Chain 2: Инструменты  │  → API, middleware, переменные окружения
+│ tools_chain           │  ChatPromptTemplate | ChatOpenAI | StrOutputParser
+│ (инструменты)         │  → API, middleware, переменные окружения
 └─────────┬────────────┘
           ▼
 ┌──────────────────────┐
-│ Chain 3: Дизайн       │  → структура файлов, классы, dispatcher
+│ design_chain          │  ChatPromptTemplate | ChatOpenAI | StrOutputParser
+│ (дизайн)              │  → структура файлов, классы, dispatcher
 └─────────┬────────────┘
           ▼
 ┌──────────────────────┐
-│ Chain 4: Код          │  → полный код бота (aiogram 3.x)
+│ code_chain            │  ChatPromptTemplate | ChatOpenAI | StrOutputParser
+│ (код)                 │  → полный код бота (aiogram 3.x)
 └─────────┬────────────┘
           ▼
 ┌──────────────────────┐
-│ Chain 5: Review       │  → 7 проверок + оценка 0–10 + ast.parse
+│ review_chain          │  ChatPromptTemplate | ChatOpenAI | StrOutputParser
+│ (ревью)               │  → 7 проверок + оценка 0–10 + ast.parse
 └─────────┬────────────┘
           ▼
    generated_bot.py  →  python generated_bot.py
@@ -198,9 +208,10 @@ LOG_LEVEL=DEBUG python script.py "Бот для опросов"           # Linu
 
 См. `requirements.txt`:
 
-- `openai>=1.0.0` — клиент OpenAI-совместимого API (ProxyAPI), нужен для работы генератора
-- `python-dotenv>=1.0.0` — загрузка переменных из `.env`, нужен для работы генератора и сгенерированных ботов
-- `aiogram>=3.7,<4.0` — фреймворк Telegram-ботов, нужен только для запуска сгенерированных ботов
+- `langchain>=0.3.0`, `langchain-openai>=0.3.0`, `langchain-core>=0.3.0` — фреймворк цепочек (`ChatPromptTemplate`, `RunnableSequence`)
+- `openai>=1.0.0` — клиент OpenAI-совместимого API (ProxyAPI)
+- `python-dotenv>=1.0.0` — загрузка переменных из `.env`
+- `aiogram>=3.7,<4.0` — фреймворк Telegram-ботов (для запуска сгенерированных ботов)
 
 Транзитивные зависимости (`httpx`, `aiohttp`, `pydantic` и др.) устанавливаются автоматически через `pip install -r requirements.txt`.
 

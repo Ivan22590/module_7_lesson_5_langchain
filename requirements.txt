@@ -3,6 +3,10 @@
 openai>=1.0.0
 # python-dotenv: загрузка переменных из .env (llm/config.py)
 python-dotenv>=1.0.0
+# langchain: фреймворк для построения цепочек (script.py)
+langchain>=0.3.0
+langchain-openai>=0.3.0
+langchain-core>=0.3.0
 
 # --- Запуск сгенерированных ботов ---
 # aiogram: фреймворк Telegram-ботов (сгенерированный код)
